@@ -1,0 +1,4 @@
+interface:
+  display_name: "Qoder Review"
+  short_description: "Run local Qoder code and security reviews"
+  default_prompt: "Use $qoder-review to review PR 1530 without posting to GitHub."

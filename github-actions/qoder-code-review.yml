@@ -1,0 +1,353 @@
+name: Qoder Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to review"
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: qoder-review-${{ github.event.pull_request.number || github.event.inputs.pr_number }}
+  cancel-in-progress: true
+
+jobs:
+  code-review:
+    name: Qoder Code Review
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Get PR diff context
+        id: diff
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUM: ${{ github.event.pull_request.number || github.event.inputs.pr_number }}
+          REPO: ${{ github.repository }}
+        run: |
+          case "$PR_NUM" in
+            ''|*[!0-9]*) echo "::error::Invalid PR number"; exit 1 ;;
+          esac
+
+          gh pr diff "$PR_NUM" --repo "$REPO" > /tmp/pr_diff.patch 2>/dev/null || true
+          gh pr view "$PR_NUM" --repo "$REPO" --json files -q '.files[].path' > /tmp/changed_files.txt 2>/dev/null || true
+
+          DIFF_SIZE=$(wc -c < /tmp/pr_diff.patch)
+          if [ "$DIFF_SIZE" -gt 100000 ]; then
+            head -c 100000 /tmp/pr_diff.patch > /tmp/pr_diff_truncated.patch
+            mv /tmp/pr_diff_truncated.patch /tmp/pr_diff.patch
+            echo "truncated=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "truncated=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "pr_num=$PR_NUM" >> "$GITHUB_OUTPUT"
+
+      - name: Run Qoder Code Review
+        env:
+          QODER_PERSONAL_ACCESS_TOKEN: ${{ secrets.QODER_PERSONAL_ACCESS_TOKEN }}
+        run: |
+          FILES=$(cat /tmp/changed_files.txt | head -50 | tr '\n' ', ')
+          DIFF=$(cat /tmp/pr_diff.patch)
+
+          PROMPT="You are reviewing a Pull Request for ${{ github.repository }}.
+
+          Perform a thorough code review covering:
+          1. Code quality: naming, readability, duplication, complexity, dead code, framework idioms
+          2. Security: injection risks, exposed secrets, authz/authn gaps, path traversal, unsafe command execution
+          3. Bugs and logic errors: races, nil/null handling, missing error checks, incorrect edge cases
+          4. Performance: unnecessary allocations, blocking operations, inefficient queries or rendering
+          5. Tests and maintainability: missing regression coverage, brittle tests, package/module boundaries
+
+          Changed files: $FILES
+
+          Diff:
+          $DIFF
+
+          Respond in this exact format:
+
+          ## Qoder Code Review
+
+          **Overall Assessment**: [APPROVE / REQUEST_CHANGES / COMMENT]
+          **Risk Level**: [low / medium / high / critical]
+
+          ## Critical Issues
+          - List blocking issues, or 'None found'
+
+          ## Security Concerns
+          - List security issues, or 'None found'
+
+          ## Bugs & Potential Issues
+          - List bugs or logic errors, or 'None found'
+
+          ## Performance
+          - List performance concerns, or 'None found'
+
+          ## Code Quality Suggestions
+          - List non-blocking suggestions, or 'None found'
+
+          ## Summary
+          2-3 sentence overall assessment."
+
+          QODER_EXIT=0
+          npx --yes @qoder-ai/qodercli@latest \
+            --model "Qwen3.8-Max" \
+            --system-prompt "Return the requested Markdown report only. Do not call tools. Do not read files. Use only the prompt content." \
+            --tools "" \
+            -p \
+            -o text \
+            "$PROMPT" > /tmp/qoder_review.raw 2>&1 || QODER_EXIT=$?
+
+          sed -E 's/\x1B\[[0-9;?]*[a-zA-Z]//g; s/\x1B\][^\x07]*\x07//g' /tmp/qoder_review.raw > /tmp/qoder_review.clean
+          if grep -n '^## Qoder Code Review' /tmp/qoder_review.clean > /dev/null; then
+            START=$(grep -n '^## Qoder Code Review' /tmp/qoder_review.clean | head -1 | cut -d: -f1)
+            tail -n +"$START" /tmp/qoder_review.clean > /tmp/qoder_review.md
+          else
+            echo "::warning::qodercli returned exit code $QODER_EXIT or no expected report header; posting cleaned fallback output"
+            tail -80 /tmp/qoder_review.clean || true
+            {
+              echo "## Qoder Code Review"
+              echo
+              echo "**Overall Assessment**: COMMENT"
+              echo "**Risk Level**: medium"
+              echo
+              echo "Qoder did not return the requested section header. Raw cleaned output follows."
+              echo
+              head -120 /tmp/qoder_review.clean
+            } > /tmp/qoder_review.md
+          fi
+
+      - name: Post review comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUM: ${{ steps.diff.outputs.pr_num }}
+          REPO: ${{ github.repository }}
+          TRUNCATED: ${{ steps.diff.outputs.truncated }}
+        run: |
+          case "$PR_NUM" in
+            ''|*[!0-9]*) echo "::error::Invalid PR number"; exit 1 ;;
+          esac
+
+          TRUNCATION_NOTE=""
+          if [ "$TRUNCATED" = "true" ]; then
+            TRUNCATION_NOTE="
+          > Diff was truncated to 100KB. Some changes may not be covered."
+          fi
+
+          REVIEW=$(cat /tmp/qoder_review.md)
+
+          {
+            printf '%s\n' "$REVIEW"
+            printf '%s\n\n---\n<sub>Automated by Qoder CLI using Qwen3.8-Max</sub>\n' "$TRUNCATION_NOTE"
+          } > /tmp/qoder_review_comment.md
+          node - /tmp/qoder_review_comment.md /tmp/qoder_review_comment_truncated.md <<'NODE'
+          const fs = require("fs");
+          const [inputPath, outputPath] = process.argv.slice(2);
+          const maxBytes = 60000;
+          const suffix =
+            "\n\n> Qoder output was truncated before posting because it exceeded GitHub comment limits.\n";
+          const text = fs.readFileSync(inputPath, "utf8");
+          if (Buffer.byteLength(text, "utf8") <= maxBytes) {
+            fs.writeFileSync(outputPath, text, "utf8");
+            process.exit(0);
+          }
+
+          const chars = Array.from(text);
+          const targetBytes = Math.max(
+            0,
+            maxBytes - Buffer.byteLength(suffix, "utf8"),
+          );
+          let low = 0;
+          let high = chars.length;
+          while (low < high) {
+            const mid = Math.ceil((low + high) / 2);
+            const candidate = chars.slice(0, mid).join("");
+            if (Buffer.byteLength(candidate, "utf8") <= targetBytes) {
+              low = mid;
+            } else {
+              high = mid - 1;
+            }
+          }
+          fs.writeFileSync(
+            outputPath,
+            `${chars.slice(0, low).join("")}${suffix}`,
+            "utf8",
+          );
+          NODE
+
+          gh api "repos/$REPO/issues/$PR_NUM/comments" --paginate -q '.[] | select(.body | startswith("## Qoder Code Review")) | .id' | while read -r comment_id; do
+            gh api -X DELETE "repos/$REPO/issues/comments/$comment_id" 2>/dev/null || true
+          done
+
+          gh pr comment "$PR_NUM" --repo "$REPO" --body-file /tmp/qoder_review_comment_truncated.md
+          echo "Posted Qoder review for PR #$PR_NUM"
+
+  security-audit:
+    name: Qoder Security Audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Get changed files
+        id: files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUM: ${{ github.event.pull_request.number || github.event.inputs.pr_number }}
+          REPO: ${{ github.repository }}
+        run: |
+          case "$PR_NUM" in
+            ''|*[!0-9]*) echo "::error::Invalid PR number"; exit 1 ;;
+          esac
+
+          gh pr diff "$PR_NUM" --repo "$REPO" > /tmp/pr_diff.patch 2>/dev/null || true
+          gh pr view "$PR_NUM" --repo "$REPO" --json files -q '.files[].path' > /tmp/changed_files.txt 2>/dev/null || true
+
+          DIFF_SIZE=$(wc -c < /tmp/pr_diff.patch)
+          if [ "$DIFF_SIZE" -gt 100000 ]; then
+            head -c 100000 /tmp/pr_diff.patch > /tmp/pr_diff_truncated.patch
+            mv /tmp/pr_diff_truncated.patch /tmp/pr_diff.patch
+          fi
+
+          echo "pr_num=$PR_NUM" >> "$GITHUB_OUTPUT"
+
+      - name: Run Qoder Security Audit
+        env:
+          QODER_PERSONAL_ACCESS_TOKEN: ${{ secrets.QODER_PERSONAL_ACCESS_TOKEN }}
+        run: |
+          FILES=$(cat /tmp/changed_files.txt | head -50 | tr '\n' ' ')
+          DIFF=$(cat /tmp/pr_diff.patch)
+
+          if echo "$FILES" | grep -qE '\.(go|py|js|jsx|ts|tsx|sql|env|yml|yaml|sh|bash|html|css|scss|json|toml|tf|rs|java|kt|php|rb|Dockerfile|dockerfile)$|(^|/)Dockerfile$'; then
+            PROMPT="You are a security auditor for ${{ github.repository }}.
+
+            Perform a focused security audit on these changed files: $FILES
+
+            Check for:
+            1. Authentication and authorization gaps
+            2. SQL, command, path traversal, header, template, SSRF, and client-side injection
+            3. Secret exposure in code, logs, configs, or GitHub Actions output
+            4. Missing input validation, unsafe parsing, type confusion, integer issues
+            5. Unsafe file, process, network, dependency, or tool execution
+            6. Agent or LLM risks when relevant: prompt injection, unsafe tool access, sandbox escape paths
+            7. API security: missing rate limits, CORS mistakes, unauthenticated sensitive endpoints
+            8. Crypto, token, cookie, and session handling mistakes
+            9. Concurrency security: races, TOCTOU, shared mutable state leaks
+
+            Changed files: $FILES
+
+            Diff:
+            $DIFF
+
+            Provide findings only when actionable.
+
+            Format:
+            ## Qoder Security Audit
+
+            **Risk Level**: [none / low / medium / high / critical]
+
+            ### Findings
+            - [SEVERITY] Description with file:line when possible, or 'None found'
+
+            ### Recommendations
+            - Actionable fix suggestions, or 'None needed'"
+
+            QODER_EXIT=0
+            npx --yes @qoder-ai/qodercli@latest \
+              --model "Qwen3.8-Max" \
+              --system-prompt "Return the requested Markdown report only. Do not call tools. Do not read files. Use only the prompt content." \
+              --tools "" \
+              -p \
+              -o text \
+              "$PROMPT" > /tmp/qoder_security.raw 2>&1 || QODER_EXIT=$?
+
+            sed -E 's/\x1B\[[0-9;?]*[a-zA-Z]//g; s/\x1B\][^\x07]*\x07//g' /tmp/qoder_security.raw > /tmp/qoder_security.clean
+            if grep -n '^## Qoder Security Audit' /tmp/qoder_security.clean > /dev/null; then
+              START=$(grep -n '^## Qoder Security Audit' /tmp/qoder_security.clean | head -1 | cut -d: -f1)
+              tail -n +"$START" /tmp/qoder_security.clean > /tmp/qoder_security.md
+            else
+              echo "::warning::qodercli returned exit code $QODER_EXIT or no expected security header; posting cleaned fallback output"
+              tail -80 /tmp/qoder_security.clean || true
+              {
+                echo "## Qoder Security Audit"
+                echo
+                echo "**Risk Level**: medium"
+                echo
+                echo "Qoder did not return the requested section header. Raw cleaned output follows."
+                echo
+                head -120 /tmp/qoder_security.clean
+              } > /tmp/qoder_security.md
+            fi
+          else
+            cat > /tmp/qoder_security.md <<'EOF'
+          ## Qoder Security Audit
+
+          **Risk Level**: none
+
+          ### Findings
+          - No security-relevant files changed.
+
+          ### Recommendations
+          - None needed.
+          EOF
+          fi
+
+      - name: Post security findings
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUM: ${{ steps.files.outputs.pr_num }}
+          REPO: ${{ github.repository }}
+        run: |
+          case "$PR_NUM" in
+            ''|*[!0-9]*) echo "::error::Invalid PR number"; exit 1 ;;
+          esac
+
+          REVIEW=$(cat /tmp/qoder_security.md)
+
+          {
+            printf '%s\n\n---\n<sub>Automated by Qoder CLI using Qwen3.8-Max</sub>\n' "$REVIEW"
+          } > /tmp/qoder_security_comment.md
+          node - /tmp/qoder_security_comment.md /tmp/qoder_security_comment_truncated.md <<'NODE'
+          const fs = require("fs");
+          const [inputPath, outputPath] = process.argv.slice(2);
+          const maxBytes = 60000;
+          const suffix =
+            "\n\n> Qoder output was truncated before posting because it exceeded GitHub comment limits.\n";
+          const text = fs.readFileSync(inputPath, "utf8");
+          if (Buffer.byteLength(text, "utf8") <= maxBytes) {
+            fs.writeFileSync(outputPath, text, "utf8");
+            process.exit(0);
+          }
+
+          const chars = Array.from(text);
+          const targetBytes = Math.max(
+            0,
+            maxBytes - Buffer.byteLength(suffix, "utf8"),
+          );
+          let low = 0;
+          let high = chars.length;
+          while (low < high) {
+            const mid = Math.ceil((low + high) / 2);
+            const candidate = chars.slice(0, mid).join("");
+            if (Buffer.byteLength(candidate, "utf8") <= targetBytes) {
+              low = mid;
+            } else {
+              high = mid - 1;
+            }
+          }
+          fs.writeFileSync(
+            outputPath,
+            `${chars.slice(0, low).join("")}${suffix}`,
+            "utf8",
+          );
+          NODE
+
+          gh api "repos/$REPO/issues/$PR_NUM/comments" --paginate -q '.[] | select(.body | startswith("## Qoder Security Audit")) | .id' | while read -r comment_id; do
+            gh api -X DELETE "repos/$REPO/issues/comments/$comment_id" 2>/dev/null || true
+          done
+
+          gh pr comment "$PR_NUM" --repo "$REPO" --body-file /tmp/qoder_security_comment_truncated.md
+          echo "Posted Qoder security audit for PR #$PR_NUM"
