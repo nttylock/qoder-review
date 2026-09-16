@@ -31,7 +31,11 @@ Same two report surfaces, two ways to run:
 ### One-liner (skills CLI)
 
 ```bash
+# interactive: pick scope + agents
 npx skills add nttylock/qoder-review
+
+# or non-interactive global install
+npx skills add nttylock/qoder-review -g -y
 ```
 
 ### Manual
